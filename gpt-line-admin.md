@@ -35,7 +35,7 @@ Do not change these decisions.
 - Language: **TypeScript**
 - UI language: **Hebrew**
 - Layout direction: **RTL**
-- Auth method: **Google Workspace SSO restricted to company domain**
+- Auth method: **Firebase Authentication using Google Sign-In with explicit operator email allowlist**
 - Data source for accounts/calls/balance: **Core API**
 - Data source for payment views: **Payment Service**
 - Browser must never talk directly to PostgreSQL or Redis
@@ -66,7 +66,7 @@ Typical operator tasks:
 The finished repository must include:
 
 - Next.js app
-- authentication setup
+- Firebase authentication setup
 - page routing
 - server actions or route handlers for backend mutations
 - API clients for Core API and Payment Service
@@ -106,12 +106,22 @@ Do not leave core pages or actions as stubs.
 ## 6. Required pages and features
 
 ### 6.1 Login / access control
-Implement a sign-in flow using Google Workspace SSO restricted to the organization’s approved domain.
+Implement a sign-in flow using Firebase Authentication with Google Sign-In.
 
 Requirements:
 - unauthenticated users are redirected to sign-in
-- unauthorized domains are denied
+- only explicitly allowlisted operator email addresses are authorized
 - operator identity email must be available server-side for audit logging
+- authentication must work with personal Gmail accounts; no Google Workspace or organization account is required
+- authorization must be enforced server-side, not only in the client
+
+Implementation rules:
+- Use Firebase Authentication as the identity provider.
+- Use Google Sign-In through Firebase Auth.
+- After successful sign-in, check the authenticated email against a server-side allowlist.
+- The allowlist must come from environment configuration, not hardcoded source.
+- If the email is not allowlisted, immediately deny access and destroy the session.
+- The authenticated operator email must be exposed server-side and attached to every mutating backend request as `admin_identity`.
 
 ### 6.2 Dashboard home
 A summary page showing:
@@ -283,7 +293,7 @@ These are the exact contracts this dashboard must target.
 **Request**
 ```json
 {
-  "admin_identity": "ops@example.com",
+  "admin_identity": "admin@gmail.com",
   "reason": "support block"
 }
 ```
@@ -294,7 +304,7 @@ These are the exact contracts this dashboard must target.
 **Request**
 ```json
 {
-  "admin_identity": "ops@example.com",
+  "admin_identity": "admin@gmail.com",
   "reason": "support unblock"
 }
 ```
@@ -307,7 +317,7 @@ These are the exact contracts this dashboard must target.
 {
   "seconds": 300,
   "reason": "support adjustment",
-  "admin_identity": "ops@example.com"
+  "admin_identity": "admin@gmail.com"
 }
 ```
 
@@ -319,7 +329,7 @@ These are the exact contracts this dashboard must target.
 {
   "seconds": 120,
   "reason": "manual correction",
-  "admin_identity": "ops@example.com"
+  "admin_identity": "admin@gmail.com"
 }
 ```
 
@@ -356,7 +366,7 @@ These are the exact contracts this dashboard must target.
 **Request**
 ```json
 {
-  "admin_identity": "ops@example.com",
+  "admin_identity": "admin@gmail.com",
   "reason": "operator terminated call"
 }
 ```
@@ -396,7 +406,7 @@ These are the exact contracts this dashboard must target.
 **Request**
 ```json
 {
-  "admin_identity": "ops@example.com",
+  "admin_identity": "admin@gmail.com",
   "reason": "manual reconciliation retry"
 }
 ```
@@ -416,6 +426,19 @@ Preferred pattern:
 
 ### 8.3 Error handling
 UI must present operator-friendly Hebrew error messages without leaking raw backend internals.
+
+### 8.4 Firebase auth session architecture
+
+Implement the auth/session flow as follows:
+
+- User clicks "Sign in with Google".
+- Browser authenticates with Firebase Auth.
+- Browser sends the Firebase ID token to a Next.js server route.
+- Server verifies the token using Firebase Admin SDK.
+- Server checks that the normalized email appears in `ALLOWED_ADMIN_EMAILS`.
+- If allowed, server creates the application session cookie.
+- All protected pages validate the server-side session before rendering.
+- All mutating actions must resolve the operator identity from the verified server session, never from client-submitted form fields.
 
 ---
 
@@ -457,7 +480,7 @@ Display full `phone_e164` in admin views because operators need to work with the
 ## 11. Security requirements
 
 - all pages require authenticated session
-- authorized domain check must be server-enforced
+- operator email allowlist check must be server-enforced
 - mutating requests require CSRF-safe implementation
 - no service tokens exposed to the browser
 - admin identity email must be attached to every mutating backend request
@@ -471,12 +494,18 @@ Provide `.env.example` with at least:
 
 ```env
 NODE_ENV=development
-NEXTAUTH_URL=http://localhost:3000
-NEXTAUTH_SECRET=replace_me
+NEXT_PUBLIC_APP_URL=http://localhost:3000
 
-GOOGLE_CLIENT_ID=replace_me
-GOOGLE_CLIENT_SECRET=replace_me
-ALLOWED_GOOGLE_WORKSPACE_DOMAIN=example.com
+FIREBASE_PROJECT_ID=replace_me
+FIREBASE_CLIENT_EMAIL=replace_me
+FIREBASE_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\nreplace_me\n-----END PRIVATE KEY-----\n"
+
+NEXT_PUBLIC_FIREBASE_API_KEY=replace_me
+NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN=replace_me.firebaseapp.com
+NEXT_PUBLIC_FIREBASE_PROJECT_ID=replace_me
+NEXT_PUBLIC_FIREBASE_APP_ID=replace_me
+
+ALLOWED_ADMIN_EMAILS=admin1@gmail.com,admin2@gmail.com
 
 CORE_API_BASE_URL=https://core.internal
 CORE_API_TOKEN=replace_me
@@ -485,7 +514,13 @@ PAYMENTS_API_BASE_URL=https://payments.internal
 PAYMENTS_API_TOKEN=replace_me
 ```
 
-If using Auth.js or another auth library, document exact setup.
+Implementation notes:
+
+- The repo must use Firebase client SDK in the browser for sign-in.
+- The repo must use Firebase Admin SDK on the server to verify the session/token.
+- `ALLOWED_ADMIN_EMAILS` is a comma-separated list of exact email addresses allowed into the dashboard.
+- The application must normalize emails to lowercase before allowlist comparison.
+- Do not rely on Firebase project membership, domain ownership, or Google Workspace.
 
 ---
 
@@ -507,7 +542,7 @@ If using Auth.js or another auth library, document exact setup.
 
 ### 13.3 Auth tests
 - unauthenticated redirect
-- unauthorized domain blocked
+- authenticated but non-allowlisted email blocked
 - authorized operator allowed
 
 ---
@@ -516,7 +551,7 @@ If using Auth.js or another auth library, document exact setup.
 
 This repository is complete only when:
 
-1. An internal operator can authenticate using Google Workspace SSO.
+1. An internal operator can authenticate using Firebase Authentication with Google Sign-In.
 2. The dashboard is fully in Hebrew and RTL.
 3. Accounts, calls, and payments can be listed and inspected.
 4. Operators can block/unblock accounts and adjust balances.

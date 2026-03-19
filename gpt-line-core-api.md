@@ -2,7 +2,7 @@
 **Suggested GitHub repository name:** `gpt-line-core-api`  
 **Service owner:** Backend / business logic developer  
 **Primary runtime:** Node.js 22 + TypeScript + PostgreSQL 16 + Redis 7  
-**Primary role:** Own all business truth for caller accounts, balance in seconds, call authorization, call finalization, credits, debits, packages, and admin operations.
+**Primary role:** Own all business truth for caller accounts, balances in seconds, package catalog, call authorization, call finalization, bridge-command coordination, credits, debits, ledger history, and admin operations.
 
 ---
 
@@ -14,19 +14,20 @@ The finished service must:
 
 - treat the caller’s phone number as the only account identifier
 - auto-create accounts on first call
-- store and expose remaining balance in **seconds**
+- store and expose remaining balance in seconds
 - authorize or deny GPT calls
 - prevent more than one active paid GPT call per phone number
 - compute live-call cutoff timestamps
 - finalize call billing exactly and safely
-- accept payment credits from the Payment Service
-- expose package data to Telephony
+- accept payment credits from the Payments Service
+- expose package data to Payments and admin consumers
 - expose balance phrasing to Telephony
 - accept bridge lifecycle events from the Realtime Bridge
+- convert bridge timing events into pending Telephony commands
+- expose command polling endpoints for Telephony
 - expose admin APIs for the Admin Dashboard
 - write an append-only ledger for all balance changes
 - guarantee idempotency where needed
-- keep its own contracts stable
 
 This repository must be sufficient for a developer to implement the full backend without opening any other repository.
 
@@ -46,36 +47,78 @@ The following are final:
 - Materialized current balance is stored on the account row in seconds
 - Every balance change must also be written to an append-only ledger
 - One active GPT call per `phone_e164` at a time
-- Final call debit is the exact whole-second duration rounded up, capped by the caller’s available preflight balance
+- Final call debit is exact whole-second duration rounded up, capped by the caller’s preflight balance
 - Package catalog is authoritative in this service
 - Admin dashboard reads and writes through this service
-- Internal auth: Bearer internal token
+- Internal auth uses bearer token
 - Timestamps stored in UTC
 
 ---
 
-## 3. Canonical phone-number contract
+## 3. Canonical shared enums owned by this service
 
-This service never accepts ambiguous phone-number formats from callers. Upstream services are expected to send canonical E.164.
+### 3.1 Call ended reason enum
 
-### 3.1 Canonical format
-Example:
-`+972501234567`
+Allowed values:
+
+- `star_exit`
+- `caller_hangup`
+- `time_expired`
+- `system_error`
+- `backend_revoke`
+- `openai_error`
+- `bridge_error`
+- `telephony_disconnect`
+
+### 3.2 Deny prompt enum
+
+Allowed values:
+
+- `no_minutes`
+- `system_error`
+- `account_blocked`
+- `account_under_review`
+- `active_call_exists`
+
+### 3.3 Bridge command enum
+
+Allowed values:
+
+- `play_warning`
+- `force_end`
+
+### 3.4 Payment result prompt enum
+
+Allowed values:
+
+- `payment_success`
+- `payment_failed`
+- `payment_cancelled`
+- `payment_unavailable`
+
+This service is the canonical source for the above values. No other service may expose conflicting enums.
+
+---
+
+## 4. Canonical phone-number contract
+
+This service accepts only canonical E.164 `phone_e164`.
 
 Validation rules:
+
 - starts with `+`
 - all remaining characters are digits
 - reject anything else with `400 Bad Request`
 
 ---
 
-## 4. Repository deliverables
+## 5. Repository deliverables
 
-This repository must include:
+The repository must include:
 
 - NestJS application source
 - database migrations
-- schema definitions / ORM mappings
+- schema / ORM mappings
 - Redis locking utilities
 - request validation
 - idempotency protections
@@ -87,19 +130,17 @@ This repository must include:
 - integration tests against PostgreSQL and Redis
 - OpenAPI / Swagger generation for internal endpoints
 - Dockerfile
-- docker-compose for local dev
+- docker-compose
 - `.env.example`
 - README and runbook
 
-Do not leave core endpoints as stubs or pseudocode.
+Do not leave core endpoints as stubs.
 
 ---
 
-## 5. Data model
+## 6. Data model
 
-Implement the following PostgreSQL tables exactly unless a minor technical improvement is required. Column names and semantics must remain the same.
-
-### 5.1 accounts
+### 6.1 accounts
 ```sql
 CREATE TABLE accounts (
   phone_e164 TEXT PRIMARY KEY,
@@ -110,7 +151,7 @@ CREATE TABLE accounts (
 );
 ```
 
-### 5.2 packages
+### 6.2 packages
 ```sql
 CREATE TABLE packages (
   package_code TEXT PRIMARY KEY,
@@ -123,7 +164,7 @@ CREATE TABLE packages (
 );
 ```
 
-Seed data must create exactly these packages:
+Seed exactly:
 
 | package_code | keypad_digit | name_he       | price_agorot | granted_seconds |
 |--------------|--------------|---------------|--------------|-----------------|
@@ -132,7 +173,7 @@ Seed data must create exactly these packages:
 | P20          | 3            | עשרים דקות    | 9000         | 1200            |
 | P40          | 4            | ארבעים דקות   | 16000        | 2400            |
 
-### 5.3 call_sessions
+### 6.3 call_sessions
 ```sql
 CREATE TABLE call_sessions (
   call_session_id TEXT PRIMARY KEY,
@@ -147,7 +188,7 @@ CREATE TABLE call_sessions (
   warning_at_seconds INTEGER NOT NULL DEFAULT 60,
   ended_reason TEXT CHECK (ended_reason IN (
     'star_exit','caller_hangup','time_expired','system_error',
-    'backend_revoke','openai_error','bridge_error'
+    'backend_revoke','openai_error','bridge_error','telephony_disconnect'
   )),
   billed_seconds INTEGER CHECK (billed_seconds >= 0),
   preflight_remaining_seconds INTEGER NOT NULL CHECK (preflight_remaining_seconds >= 0),
@@ -155,7 +196,7 @@ CREATE TABLE call_sessions (
 );
 ```
 
-### 5.4 balance_ledger
+### 6.4 balance_ledger
 ```sql
 CREATE TABLE balance_ledger (
   ledger_id BIGSERIAL PRIMARY KEY,
@@ -171,7 +212,7 @@ CREATE TABLE balance_ledger (
 );
 ```
 
-### 5.5 purchase_credits
+### 6.5 purchase_credits
 ```sql
 CREATE TABLE purchase_credits (
   payment_txn_id TEXT PRIMARY KEY,
@@ -185,7 +226,26 @@ CREATE TABLE purchase_credits (
 );
 ```
 
-### 5.6 admin_audit_log
+### 6.6 bridge_commands
+```sql
+CREATE TABLE bridge_commands (
+  command_id BIGSERIAL PRIMARY KEY,
+  call_session_id TEXT NOT NULL REFERENCES call_sessions(call_session_id),
+  command TEXT NOT NULL CHECK (command IN ('play_warning','force_end')),
+  reason TEXT NOT NULL,
+  is_acknowledged BOOLEAN NOT NULL DEFAULT false,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  acknowledged_at TIMESTAMPTZ
+);
+```
+
+Rules:
+
+- `play_warning` may appear at most once per call
+- only one unacknowledged `force_end` command may exist per call
+- Telephony command polling consumes this table logically, but explicit acknowledgment is required
+
+### 6.7 admin_audit_log
 ```sql
 CREATE TABLE admin_audit_log (
   audit_id BIGSERIAL PRIMARY KEY,
@@ -200,75 +260,104 @@ CREATE TABLE admin_audit_log (
 
 ---
 
-## 6. Core business rules
-
-These rules are mandatory.
+## 7. Core business rules
 
 ### Rule 1: Account creation
-If `phone_e164` does not exist, create an account automatically with:
+
+If `phone_e164` does not exist, create account:
+
 - `status = active`
 - `remaining_seconds = 0`
 
 ### Rule 2: Allowed statuses
-Only `active` accounts may start AI calls and receive payment credits normally.  
+
+Only `active` accounts may start AI calls and receive payment credits normally.
+
 `blocked` accounts:
 - cannot start AI calls
-- cannot buy more minutes until unblocked
+- payment credits are rejected
 
 `fraud_review` accounts:
-- deny AI calls
-- deny new credits unless specifically allowed by future policy
+- cannot start AI calls
+- payment credits are rejected
 
 ### Rule 3: One active AI call per phone number
-There may be at most one active GPT call for a given `phone_e164` at any time.
+
+At most one active GPT call per `phone_e164`.
 
 Use Redis lock:
 `active_call:{phone_e164}`
 
 ### Rule 4: Preflight balance check
+
 A call is allowed only if:
+
 - account status is `active`
 - `remaining_seconds >= 1`
 - no active call lock exists
 
 ### Rule 5: Cutoff calculation
+
 At preflight:
+
 `absolute_cutoff_at = now() + remaining_seconds seconds`
 
 ### Rule 6: Warning threshold
-Default `warning_at_seconds = 60`.  
-If the caller has less than or equal to 60 seconds at preflight, still allow the call, but do not rely on the warning being meaningful. The bridge may fire it immediately if threshold is met; Telephony should still handle it gracefully.
+
+Default `warning_at_seconds = 60`
 
 ### Rule 7: Final debit
+
 At call end:
-`billed_seconds = ceil(ended_at - connected_at)` in whole seconds
 
-If `connected_at` is null, then `billed_seconds = 0`.
+`billed_seconds = ceil(ended_at - connected_at)`
 
-Cap billed seconds by the session’s `preflight_remaining_seconds`.
+If `connected_at` is null, billed seconds are 0.
 
-### Rule 8: Balance update transactionality
+Cap billed seconds by `preflight_remaining_seconds`.
+
+### Rule 8: Transactionality
+
 Whenever balance changes:
+
 - update `accounts.remaining_seconds`
 - insert corresponding `balance_ledger` row
 
-These must happen in the same DB transaction.
+in the same DB transaction.
 
-### Rule 9: Idempotent payment credit
-A payment credit is unique by `payment_txn_id`.  
-If the same transaction arrives again, the credit must not be applied twice.
+### Rule 9: Payment credit idempotency
+
+Unique by `payment_txn_id`.
 
 ### Rule 10: End-call idempotency
-Calling `POST /internal/telephony/calls/end` multiple times for the same `call_session_id` must not double-debit.
+
+Repeated end-call requests must never double-debit.
+
+### Rule 11: Warning command creation
+
+On the first `bridge-warning-due` event for a call that is not ended:
+
+- create one `bridge_commands` row with `command = play_warning`
+- ignore duplicates idempotently
+
+### Rule 12: Force-end command creation
+
+Create `force_end` command when:
+
+- `bridge-cutoff-due` arrives
+- admin terminate request is accepted
+- internal system policy needs revocation in future versions
+
+### Rule 13: Telephony command acknowledgment
+
+Commands remain pending until Telephony explicitly acknowledges them.
 
 ---
 
-## 7. Internal APIs for Telephony
+## 8. Internal APIs for Telephony
 
-These endpoints are authoritative.
+### 8.1 Ensure caller exists
 
-### 7.1 Ensure caller exists
-**Endpoint**  
 `POST /internal/telephony/caller/ensure`
 
 **Request**
@@ -280,11 +369,6 @@ These endpoints are authoritative.
 }
 ```
 
-**Behavior**
-- validate `phone_e164`
-- create account if missing
-- return current status
-
 **Response**
 ```json
 {
@@ -293,8 +377,8 @@ These endpoints are authoritative.
 }
 ```
 
-### 7.2 Balance lookup
-**Endpoint**  
+### 8.2 Balance lookup
+
 `GET /internal/telephony/balance/:phone_e164`
 
 **Response**
@@ -306,10 +390,8 @@ These endpoints are authoritative.
 }
 ```
 
-The service must generate `speakable_hebrew_text` itself so Telephony does not need Hebrew grammar logic.
+### 8.3 Call preflight
 
-### 7.3 Call preflight
-**Endpoint**  
 `POST /internal/telephony/calls/preflight`
 
 **Request**
@@ -322,18 +404,7 @@ The service must generate `speakable_hebrew_text` itself so Telephony does not n
 }
 ```
 
-**Behavior**
-1. Validate request.
-2. Lock account row `FOR UPDATE`.
-3. Ensure account exists or create it.
-4. Check account status.
-5. Acquire Redis lock `active_call:{phone_e164}`.
-6. If balance is zero or account not active, deny and release lock if acquired.
-7. Create `call_session_id`.
-8. Insert `call_sessions` row with state `preflighted`.
-9. Return timing information.
-
-**Allowed response**
+**Allowed**
 ```json
 {
   "allowed": true,
@@ -344,7 +415,7 @@ The service must generate `speakable_hebrew_text` itself so Telephony does not n
 }
 ```
 
-**Denied response**
+**Denied**
 ```json
 {
   "allowed": false,
@@ -352,12 +423,60 @@ The service must generate `speakable_hebrew_text` itself so Telephony does not n
 }
 ```
 
-`deny_prompt` allowed values:
-- `no_minutes`
-- `system_error`
+Deny prompt mapping:
 
-### 7.4 End call
-**Endpoint**  
+- `remaining_seconds == 0` -> `no_minutes`
+- `status == blocked` -> `account_blocked`
+- `status == fraud_review` -> `account_under_review`
+- existing active call lock -> `active_call_exists`
+- unexpected internal failure -> `system_error`
+
+### 8.4 Poll call command
+
+`GET /internal/telephony/calls/:call_session_id/command`
+
+**No command**
+```json
+{
+  "call_session_id": "call_01JPK9VV71D3Q0N3G2P5R5B8D1",
+  "pending_command": null
+}
+```
+
+**Command pending**
+```json
+{
+  "call_session_id": "call_01JPK9VV71D3Q0N3G2P5R5B8D1",
+  "pending_command": {
+    "command": "play_warning",
+    "reason": "time_threshold",
+    "created_at": "2026-03-16T09:45:13.000Z"
+  }
+}
+```
+
+### 8.5 Acknowledge call command
+
+`POST /internal/telephony/calls/command/ack`
+
+**Request**
+```json
+{
+  "call_session_id": "call_01JPK9VV71D3Q0N3G2P5R5B8D1",
+  "command": "play_warning",
+  "executed_at": "2026-03-16T09:45:13.400Z"
+}
+```
+
+**Response**
+```json
+{
+  "ok": true
+}
+```
+
+### 8.6 End call
+
 `POST /internal/telephony/calls/end`
 
 **Request**
@@ -371,17 +490,18 @@ The service must generate `speakable_hebrew_text` itself so Telephony does not n
 ```
 
 **Behavior**
-1. Find `call_sessions` row.
-2. If already ended, return `ok=true` without further debit.
-3. Compute `billed_seconds`.
-4. In a single transaction:
-   - mark call ended
-   - set `ended_reason`
-   - set `ended_at`
-   - set `billed_seconds`
-   - decrement account balance by billed seconds
-   - insert `balance_ledger` row of type `call_debit`
-5. Release Redis active call lock.
+
+1. Find session
+2. If already ended, return idempotent success
+3. Compute billed seconds
+4. In one transaction:
+   - mark ended
+   - set ended reason
+   - set ended time
+   - set billed seconds
+   - decrement balance
+   - insert call-debit ledger row
+5. Release active call Redis lock
 
 **Response**
 ```json
@@ -394,10 +514,10 @@ The service must generate `speakable_hebrew_text` itself so Telephony does not n
 
 ---
 
-## 8. Internal APIs for Bridge events
+## 9. Internal APIs for Bridge events
 
-### 8.1 Bridge connected
-**Endpoint**  
+### 9.1 Bridge connected
+
 `POST /internal/events/bridge-connected`
 
 **Request**
@@ -409,19 +529,15 @@ The service must generate `speakable_hebrew_text` itself so Telephony does not n
 }
 ```
 
-**Behavior**
-- set `connected_at`
-- set state `connected`
-
-**Response**
+Response:
 ```json
 {
   "ok": true
 }
 ```
 
-### 8.2 Warning due
-**Endpoint**  
+### 9.2 Bridge warning due
+
 `POST /internal/events/bridge-warning-due`
 
 **Request**
@@ -433,19 +549,13 @@ The service must generate `speakable_hebrew_text` itself so Telephony does not n
 }
 ```
 
-**Behavior**
-- if call not yet ended, set state `warning_sent`
-- response should remain idempotent
+Behavior:
 
-**Response**
-```json
-{
-  "ok": true
-}
-```
+- if call not ended and warning command not yet created, create `play_warning`
+- set state `warning_sent` idempotently
 
-### 8.3 Cutoff due
-**Endpoint**  
+### 9.3 Bridge cutoff due
+
 `POST /internal/events/bridge-cutoff-due`
 
 **Request**
@@ -456,19 +566,12 @@ The service must generate `speakable_hebrew_text` itself so Telephony does not n
 }
 ```
 
-**Behavior**
-- mark internally that the call should be considered cutoff-driven if not already ended
-- this service does not itself play prompts; telephony handles audio to the caller
+Behavior:
 
-**Response**
-```json
-{
-  "ok": true
-}
-```
+- if call not yet ended, create pending `force_end` command with reason `time_expired` unless already present
 
-### 8.4 Bridge ended
-**Endpoint**  
+### 9.4 Bridge ended
+
 `POST /internal/events/bridge-ended`
 
 **Request**
@@ -481,23 +584,18 @@ The service must generate `speakable_hebrew_text` itself so Telephony does not n
 }
 ```
 
-**Behavior**
-- if the call is not ended yet, this event may be stored/logged but the official account debit still occurs through `telephony/calls/end`
-- do not double-debit here
+Behavior:
 
-**Response**
-```json
-{
-  "ok": true
-}
-```
+- store/log bridge termination lifecycle info
+- do not debit here
+- do not conflict with official Telephony end-call debit flow
 
 ---
 
-## 9. Internal APIs for Payment Service
+## 10. Internal APIs for Payments
 
-### 9.1 Apply payment credit
-**Endpoint**  
+### 10.1 Apply payment credit
+
 `POST /internal/payments/credit`
 
 **Request**
@@ -513,15 +611,6 @@ The service must generate `speakable_hebrew_text` itself so Telephony does not n
 }
 ```
 
-**Behavior**
-1. Validate package exists and is active.
-2. Ensure `amount_agorot` and `granted_seconds` match the catalog for that package.
-3. If `payment_txn_id` already exists in `purchase_credits`, return idempotent success.
-4. In a single transaction:
-   - insert purchase_credits row
-   - increment `accounts.remaining_seconds`
-   - insert `balance_ledger` row of type `purchase_credit`
-
 **Response**
 ```json
 {
@@ -531,8 +620,8 @@ The service must generate `speakable_hebrew_text` itself so Telephony does not n
 }
 ```
 
-### 9.2 Package list for Telephony and Payment
-**Endpoint**  
+### 10.2 Package catalog
+
 `GET /internal/catalog/packages`
 
 **Response**
@@ -547,125 +636,127 @@ The service must generate `speakable_hebrew_text` itself so Telephony does not n
 }
 ```
 
-Telephony may consume a narrower payment-oriented view, but this service is the catalog authority.
-
 ---
 
-## 10. Admin API requirements
+## 11. Admin API requirements
 
-These endpoints are consumed by the Admin Dashboard.
+### 11.1 Dashboard summary
 
-### 10.1 List accounts
+`GET /admin/summary`
+
+**Response**
+```json
+{
+  "active_call_count": 3,
+  "active_account_count": 1250,
+  "blocked_account_count": 7,
+  "recent_purchase_count_24h": 16,
+  "recent_failed_purchase_count_24h": 2
+}
+```
+
+### 11.2 List accounts
+
 `GET /admin/accounts?search=...&status=...&page=...`
 
-Response items must include:
-- `phone_e164`
-- `status`
-- `remaining_seconds`
-- `last_call_at`
-- `lifetime_purchased_seconds`
-- `lifetime_consumed_seconds`
+### 11.3 Get account detail
 
-### 10.2 Get account detail
 `GET /admin/accounts/:phone_e164`
 
-Must include:
-- account summary
-- recent call sessions
-- recent ledger entries
-- recent purchases
+### 11.4 Block account
 
-### 10.3 Block account
 `POST /admin/accounts/:phone_e164/block`
 
-### 10.4 Unblock account
+### 11.5 Unblock account
+
 `POST /admin/accounts/:phone_e164/unblock`
 
-### 10.5 Admin credit
+### 11.6 Admin credit
+
 `POST /admin/accounts/:phone_e164/credit`
 
-Request:
-```json
-{
-  "seconds": 300,
-  "reason": "support adjustment",
-  "admin_identity": "ops@example.com"
-}
-```
+### 11.7 Admin debit
 
-### 10.6 Admin debit
 `POST /admin/accounts/:phone_e164/debit`
 
-Request:
-```json
-{
-  "seconds": 120,
-  "reason": "manual correction",
-  "admin_identity": "ops@example.com"
-}
-```
+### 11.8 List calls
 
-### 10.7 List calls
-`GET /admin/calls?page=...&phone=...`
+`GET /admin/calls?page=...&phone=...&state=...`
 
-### 10.8 Get single call
+Response items for active calls must include:
+
+- `estimated_duration_seconds`
+- `estimated_remaining_seconds`
+
+in addition to standard timing fields.
+
+### 11.9 Get single call
+
 `GET /admin/calls/:call_session_id`
 
-### 10.9 Terminate active call
+### 11.10 Terminate active call
+
 `POST /admin/calls/:call_session_id/terminate`
 
-This endpoint must mark the session for backend revocation and is expected to be consumed by an operator workflow. The exact telephony-side enforcement can be implemented via future signaling, but the endpoint must exist and log the request.
+Behavior:
 
-### 10.10 Audit logging
-Every admin mutating endpoint must write to `admin_audit_log`.
+- record admin audit entry
+- if call is still active, create pending `force_end` bridge command with reason `backend_revoke`
+- do not directly debit the call here
+- Telephony later executes the actual termination and normal call-finalization path
+
+### 11.11 Audit logging
+
+Every mutating admin endpoint must write `admin_audit_log`.
 
 ---
 
-## 11. Hebrew balance phrasing rules
-
-This service must return `speakable_hebrew_text` for balance inquiries.
+## 12. Hebrew balance phrasing rules
 
 Required examples:
-- `0` → `לא נותרו לך דקות לשיחה`
-- `60` → `נותרה לך דקה אחת`
-- `120` → `נותרו לך 2 דקות`
-- `287` → `נותרו לך 4 דקות ו-47 שניות`
-- `59` → `נותרו לך 59 שניות`
 
-Implement a deterministic Hebrew formatter so Telephony does not need any linguistic logic.
+- `0` -> `לא נותרו לך דקות לשיחה`
+- `60` -> `נותרה לך דקה אחת`
+- `120` -> `נותרו לך 2 דקות`
+- `287` -> `נותרו לך 4 דקות ו-47 שניות`
+- `59` -> `נותרו לך 59 שניות`
+
+Implement deterministic phrasing in Core.
 
 ---
 
-## 12. Redis requirements
+## 13. Redis requirements
 
 Use Redis for:
+
 - active call lock: `active_call:{phone_e164}`
-- optional short-lived idempotency / coordination helpers
+- optional short-lived idempotency helpers
 
-Redis is not business truth. If Redis state and PostgreSQL disagree, PostgreSQL and reconciliation logic win.
+Redis is not business truth.
 
-### 12.1 Active call lock behavior
-- Set with `NX`
-- TTL: 6 hours
+Active-call lock behavior:
+
+- set with `NX`
+- TTL 6 hours
 - release on successful call finalization
 - if lock exists during preflight, deny call
-- if a stale lock is suspected, validate against `call_sessions`
+- stale-lock reconciliation must consult PostgreSQL
 
 ---
 
-## 13. Security requirements
+## 14. Security requirements
 
-- validate all request bodies strictly
+- strict validation on all request bodies
 - mask phone numbers in ordinary logs when feasible
 - never log raw bearer tokens
 - least-privilege DB credentials
 - all mutating admin actions require authenticated upstream identity
 - avoid overexposing internals in 500 responses
-- keep OpenAPI docs internal only
+- internal OpenAPI only
 
 ---
 
-## 14. Configuration and environment variables
+## 15. Configuration and environment variables
 
 Provide `.env.example` including at least:
 
@@ -682,47 +773,52 @@ ADMIN_API_TOKEN=replace_me
 LOG_LEVEL=info
 ```
 
-If using separate tokens per upstream service, include them explicitly and document them.
-
 ---
 
-## 15. Required tests
+## 16. Required tests
 
-### 15.1 Unit tests
+### 16.1 Unit tests
+
 - phone validation
 - Hebrew balance formatter
 - call preflight allow path
-- call preflight deny on zero balance
-- call preflight deny on blocked account
-- final billed seconds calculation
-- cap billed seconds by preflight balance
+- call preflight deny by each deny reason
+- billed seconds calculation
+- billed seconds cap by preflight balance
 - idempotent payment credit
 - idempotent call end
+- warning command creation
+- force-end command creation
+- command acknowledgment
 - admin credit/debit ledger writes
 
-### 15.2 Integration tests
-Against real PostgreSQL and Redis containers:
+### 16.2 Integration tests
+
+Against PostgreSQL and Redis:
+
 - auto-create account on ensure caller
 - successful call preflight acquires lock
 - duplicate simultaneous preflight denied
 - bridge connected updates state
-- warning event idempotent
+- warning event creates one pending warning command
+- cutoff event creates one pending force-end command
 - payment credit increments balance and ledger
 - repeated payment callback does not double-credit
 - end call decrements balance and releases lock
 - admin block prevents future preflight
+- admin terminate creates backend-revoke force-end command
 
 ---
 
-## 16. Definition of done
+## 17. Definition of done
 
 This repository is complete only when:
 
-1. The Telephony service can ensure callers, check balances, preflight calls, and end calls successfully.
-2. The Payment Service can apply credits exactly once.
-3. The Bridge can report lifecycle events without causing double-debits.
-4. The Admin Dashboard can list accounts, calls, purchases, and perform adjustments.
-5. Balances are always correct in seconds.
-6. Ledger history fully explains every balance change.
-7. One active call per phone number is enforced.
-8. The repo contains all schema, code, tests, and docs needed to run the service end to end.
+1. Telephony can ensure callers, check balances, preflight calls, poll commands, acknowledge commands, and end calls successfully
+2. Payments can apply credits exactly once
+3. Bridge can report lifecycle events and timing events without causing double-debits
+4. Admin can list accounts, calls, purchases, dashboard summary, and perform adjustments
+5. Balances are always correct in seconds
+6. Ledger history explains every balance change
+7. One active call per phone number is enforced
+8. The repo contains all schema, code, tests, and docs needed to run the service end to end

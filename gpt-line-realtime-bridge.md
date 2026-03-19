@@ -2,7 +2,7 @@
 **Suggested GitHub repository name:** `gpt-line-realtime-bridge`  
 **Service owner:** Realtime voice / AI media developer  
 **Primary runtime:** Node.js 22 + TypeScript  
-**Primary role:** Bridge live caller audio from the telephony system to OpenAI Realtime and return assistant audio back to the caller.
+**Primary role:** Bridge live caller audio from the telephony system to OpenAI Realtime and return assistant audio back to the caller while emitting timing and lifecycle events to the Core API.
 
 ---
 
@@ -12,14 +12,14 @@ Build the production Realtime Bridge for GPT-Line. This repository must fully im
 
 The finished service must:
 
-- accept live call start requests from the telephony service
+- accept live call start requests from the Telephony service
 - create one OpenAI Realtime session per active call
 - bridge bidirectional audio between Asterisk and OpenAI
 - enforce the exact Hebrew assistant behavior described below
 - support interruption / barge-in cleanly
-- stop speaking immediately when the telephony service ends the session
-- track the absolute time cutoff received from the Core API and trigger warning/cutoff events on schedule
-- emit all required lifecycle events back to the Core API
+- stop speaking immediately when Telephony ends the session
+- track the absolute time cutoff received from Core preflight data
+- emit all required lifecycle events and timing events back to the Core API
 - expose health endpoints and session state
 - never own billing truth
 - never store payment information
@@ -31,24 +31,48 @@ This service is the only service allowed to communicate directly with OpenAI Rea
 
 ## 2. Hard decisions already locked
 
-Do not change any of these decisions.
+Do not change these decisions.
 
 - Runtime: **Node.js 22**
 - Language: **TypeScript**
 - HTTP framework: **Fastify**
 - Realtime provider: **OpenAI Realtime**
 - Session mode: **server-side realtime session controlled by this service**
-- One active GPT session per call session
+- One active GPT session per `call_session_id`
 - Primary account identifier passed through the system: `phone_e164`
 - Primary live-session identifier: `call_session_id`
 - Balance/cutoff truth comes from the Core API, not from this service
-- This service must never speak directly to callers about balance in its own words; it only emits events so telephony can play human prerecorded prompts
+- This service must never speak directly to callers about balance in its own words
 - No long-term transcript storage by default
 - No raw payment data ever
 
 ---
 
-## 3. External systems this repo must integrate with
+## 3. Canonical shared enums used by this service
+
+### 3.1 Call ended reason enum
+
+Allowed values:
+
+- `star_exit`
+- `caller_hangup`
+- `time_expired`
+- `system_error`
+- `backend_revoke`
+- `openai_error`
+- `bridge_error`
+- `telephony_disconnect`
+
+### 3.2 Bridge timing event enum
+
+Allowed timing events emitted to Core:
+
+- `bridge-warning-due`
+- `bridge-cutoff-due`
+
+---
+
+## 4. External systems this repo must integrate with
 
 This repo must integrate with:
 
@@ -56,32 +80,33 @@ This repo must integrate with:
 2. **Core API Service**
 3. **OpenAI Realtime**
 
-The exact contracts are specified in this document. No outside repo is needed.
+The exact contracts are specified here.
 
 ---
 
-## 4. Overall role in the product
+## 5. Overall role in the product
 
 Caller flow summary:
 
-1. The caller presses `1` on the phone menu.
-2. Telephony asks the Core API whether the call is allowed.
-3. If allowed, Telephony calls this service to start a bridge.
-4. This service creates the OpenAI Realtime session and begins streaming audio.
+1. The caller presses `1` on the phone menu
+2. Telephony asks Core whether the call is allowed
+3. If allowed, Telephony calls this service to start a bridge
+4. This service creates the OpenAI Realtime session and begins streaming audio
 5. During the conversation, this service:
    - forwards caller audio to OpenAI
    - forwards assistant audio back to the caller
    - handles interruptions
    - tracks warning and timeout thresholds
-6. If the caller presses `*`, Telephony calls this service to stop.
-7. If time reaches zero, this service emits a cutoff event and stops the AI side.
-8. Telephony plays the proper human prerecorded prompt and returns the caller to the main menu.
+6. If the caller presses `*`, Telephony calls this service to stop
+7. If time reaches the warning threshold, this service emits `bridge-warning-due` to Core
+8. If time reaches zero, this service emits `bridge-cutoff-due` to Core and ends the AI side
+9. Telephony later learns about the resulting command from Core and handles caller-facing prompts and menu return
 
 ---
 
-## 5. Required repository output
+## 6. Required repository output
 
-The finished repository must include:
+The repository must include:
 
 - application source code
 - API server
@@ -89,7 +114,7 @@ The finished repository must include:
 - audio/media bridge implementation
 - OpenAI adapter
 - session timer subsystem
-- webhook/event client for Core API
+- event client for Core
 - unit tests
 - integration tests
 - mocked OpenAI tests
@@ -101,14 +126,13 @@ The finished repository must include:
 - structured logging
 - graceful shutdown logic
 
-Do not leave core behavior as stubs or TODOs.
+Do not leave core behavior as stubs.
 
 ---
 
-## 6. Repository architecture
+## 7. Repository architecture
 
-### 6.1 Required modules
-Implement the code in clear modules similar to:
+### 7.1 Required modules
 
 ```text
 /
@@ -137,34 +161,28 @@ Implement the code in clear modules similar to:
   .env.example
 ```
 
-### 6.2 Internal design requirements
+### 7.2 Internal design requirements
+
 The service must include these internal responsibilities:
 
 - `CallSessionRegistry`
-  - in-memory registry of active sessions
 - `OpenAISessionClient`
-  - session creation, update, cancel, terminate
 - `MediaBridge`
-  - bi-directional audio wiring between Asterisk media endpoint and OpenAI realtime stream
 - `TimerSupervisor`
-  - warning and cutoff scheduling
 - `CoreApiEventClient`
-  - sends bridge lifecycle events to Core API
 - `BridgeController`
-  - orchestrates start/end lifecycle
 - `SessionCleanupManager`
-  - ensures no leaked sessions or sockets after end
 
 ---
 
-## 7. Session identifiers and fields
+## 8. Session identifiers and runtime fields
 
-### 7.1 Primary identifiers
-- `call_session_id`: unique string, generated by Core API
-- `phone_e164`: canonical caller phone number, for example `+972501234567`
+### 8.1 Primary identifiers
 
-### 7.2 Required runtime session record
-Every active call must have an in-memory record with at least:
+- `call_session_id`
+- `phone_e164`
+
+### 8.2 Required runtime session record
 
 ```ts
 type ActiveBridgeSession = {
@@ -179,23 +197,21 @@ type ActiveBridgeSession = {
   bridgeState: 'starting' | 'connected' | 'ending' | 'ended' | 'error';
   warningSent: boolean;
   connectedAt?: string;
-  terminatedReason?: 'star_exit' | 'caller_hangup' | 'time_expired' | 'backend_revoke' | 'openai_error' | 'telephony_disconnect';
+  terminatedReason?: 'star_exit' | 'caller_hangup' | 'time_expired' | 'system_error' | 'backend_revoke' | 'openai_error' | 'bridge_error' | 'telephony_disconnect';
 };
 ```
 
-### 7.3 Persistence rule
-This service may keep active state in memory and optionally mirror it in Redis, but it must not persist bridge state as business truth in PostgreSQL. The source of truth for billing remains the Core API.
+### 8.3 Persistence rule
+
+This service may keep active state in memory and optionally mirror it in Redis, but it must not persist bridge state as business truth in PostgreSQL. Billing truth remains in Core.
 
 ---
 
-## 8. HTTP API this service must expose
+## 9. HTTP API this service must expose
 
-### 8.1 Start bridge
-**Endpoint**  
+### 9.1 Start bridge
+
 `POST /internal/bridge/start`
-
-**Auth required**  
-Bearer internal token
 
 **Request**
 ```json
@@ -213,16 +229,17 @@ Bearer internal token
 ```
 
 **Behavior**
-1. Validate request.
-2. Reject if session already exists.
-3. Create an OpenAI Realtime session.
-4. Apply the required Hebrew system instructions.
-5. Create the media bridge to the supplied Asterisk media IP/port.
-6. Mark the session `connected`.
-7. Emit a `bridge-connected` event to Core API.
-8. Return success.
 
-**Success response**
+1. Validate request
+2. Reject if session already exists
+3. Create an OpenAI Realtime session
+4. Apply the required Hebrew system instructions
+5. Create the media bridge to the supplied Asterisk media IP/port
+6. Mark the session `connected`
+7. Emit `bridge-connected` to Core
+8. Return success
+
+**Success**
 ```json
 {
   "ok": true,
@@ -231,7 +248,7 @@ Bearer internal token
 }
 ```
 
-**Failure response**
+**Failure**
 ```json
 {
   "ok": false,
@@ -239,8 +256,8 @@ Bearer internal token
 }
 ```
 
-### 8.2 End bridge
-**Endpoint**  
+### 9.2 End bridge
+
 `POST /internal/bridge/end`
 
 **Request**
@@ -251,32 +268,27 @@ Bearer internal token
 }
 ```
 
-Allowed reasons:
-- `star_exit`
-- `caller_hangup`
-- `time_expired`
-- `backend_revoke`
-- `system_error`
-- `telephony_disconnect`
+Allowed reasons are the canonical ended-reason enum.
 
 **Behavior**
-1. Look up the active session.
-2. Stop accepting new caller audio.
-3. Cancel any in-progress assistant speech.
-4. Tear down the media bridge.
-5. End the OpenAI session.
-6. Emit `bridge-ended` to Core API.
-7. Release all resources.
 
-**Success response**
+1. Look up the active session
+2. Stop accepting caller audio
+3. Cancel assistant audio immediately
+4. Tear down media bridge
+5. End the OpenAI session
+6. Emit `bridge-ended` to Core
+7. Release all resources
+
+**Success**
 ```json
 {
   "ok": true
 }
 ```
 
-### 8.3 Get session health
-**Endpoint**  
+### 9.3 Get session health
+
 `GET /internal/bridge/health/:call_session_id`
 
 **Response**
@@ -289,8 +301,8 @@ Allowed reasons:
 }
 ```
 
-### 8.4 Generic health endpoint
-**Endpoint**  
+### 9.4 Generic health endpoint
+
 `GET /health`
 
 **Response**
@@ -303,12 +315,12 @@ Allowed reasons:
 
 ---
 
-## 9. Core API event contracts
+## 10. Core API event contracts consumed by this design
 
-This service must send the following events to the Core API.
+This service must send the following events to Core.
 
-### 9.1 Bridge connected
-**Endpoint**  
+### 10.1 Bridge connected
+
 `POST /internal/events/bridge-connected`
 
 **Request**
@@ -320,8 +332,8 @@ This service must send the following events to the Core API.
 }
 ```
 
-### 9.2 Warning due
-**Endpoint**  
+### 10.2 Bridge warning due
+
 `POST /internal/events/bridge-warning-due`
 
 **Request**
@@ -333,8 +345,8 @@ This service must send the following events to the Core API.
 }
 ```
 
-### 9.3 Cutoff due
-**Endpoint**  
+### 10.3 Bridge cutoff due
+
 `POST /internal/events/bridge-cutoff-due`
 
 **Request**
@@ -345,8 +357,8 @@ This service must send the following events to the Core API.
 }
 ```
 
-### 9.4 Bridge ended
-**Endpoint**  
+### 10.4 Bridge ended
+
 `POST /internal/events/bridge-ended`
 
 **Request**
@@ -359,135 +371,152 @@ This service must send the following events to the Core API.
 }
 ```
 
-### 9.5 Retry behavior
+### 10.5 Retry behavior
+
 For all Core API events:
+
 - retry on 5xx or timeout using exponential backoff
 - maximum retry window: 60 seconds
-- after max retries, log an error with the masked phone number and keep cleaning up local resources
-- do not block bridge teardown forever waiting on Core API
+- after max retries, log an error with masked phone number and keep cleaning up local resources
+- do not block bridge teardown forever waiting on Core
 
 ---
 
-## 10. OpenAI assistant behavior this service must enforce
+## 11. OpenAI assistant behavior this service must enforce
 
-The assistant instructions are fully owned by this service.
-
-### 10.1 Required system instructions
 At session creation, apply instructions equivalent to:
 
-- Speak in clear, natural Hebrew by default.
-- Be concise and practical.
-- Avoid long lists.
-- Ask one question at a time.
-- Avoid speaking too quickly.
-- Avoid slang that sounds foreign or internet-native.
-- If the caller asks in another language, switch appropriately.
-- Do not claim to be a rabbi, doctor, lawyer, therapist, or emergency responder.
-- For halachic, medical, legal, or urgent safety issues, politely advise the caller to consult a qualified human authority.
-- If the caller sounds emotionally distressed or in danger, respond calmly and encourage contacting a trusted person or emergency help immediately.
-- Never mention websites or internet-based steps unless the caller explicitly asks.
-- Keep answers short enough for comfortable phone listening.
-- If the caller is silent for a while, gently invite them to continue.
+- Speak in clear, natural Hebrew by default
+- Be concise and practical
+- Ask one question at a time
+- Avoid speaking too quickly
+- Avoid slang that sounds foreign or internet-native
+- If the caller asks in another language, switch appropriately
+- Do not claim to be a rabbi, doctor, lawyer, therapist, or emergency responder
+- For halachic, medical, legal, or urgent safety issues, politely advise the caller to consult a qualified human authority
+- If the caller sounds emotionally distressed or in danger, respond calmly and encourage contacting a trusted person or emergency help immediately
+- Never mention websites or internet-based steps unless explicitly asked
+- Keep answers short enough for comfortable phone listening
+- If the caller is silent for a while, gently invite them to continue
 
-### 10.2 Output style rules
+Output style rules:
+
 - default language: Hebrew
 - maximum uninterrupted assistant speech target: about 18 seconds
-- if the answer is getting longer, summarize and stop
-- do not produce bulleted lists verbally unless caller explicitly asks for a list
+- no long verbal lists unless asked
 - one response at a time
 
 ---
 
-## 11. Audio and interruption behavior
+## 12. Audio and interruption behavior
 
-### 11.1 Codec
-Use `pcmu` / G.711 µ-law for the Asterisk-facing media leg unless explicitly configured otherwise in a future version. This document assumes `pcmu`.
+### 12.1 Codec
 
-### 11.2 Barge-in behavior
-This service must support interruption cleanly.
+Use `pcmu`.
 
-If the caller starts speaking while the assistant is currently speaking:
-1. stop the current assistant response generation/output
-2. clear any queued assistant audio not yet played
-3. keep the server-side conversation state aligned so the assistant does not assume the caller heard text that never finished playing
+### 12.2 Barge-in behavior
+
+If caller speech starts while the assistant is speaking:
+
+1. stop current assistant response output
+2. clear queued assistant audio
+3. keep conversation state aligned so the model does not assume the caller heard truncated speech
 4. continue with the caller’s next turn
 
-### 11.3 Star-exit behavior
-If Telephony calls `POST /internal/bridge/end` because `*` was pressed:
+### 12.3 Star-exit behavior
+
+If Telephony calls `/internal/bridge/end` because `*` was pressed:
+
 - stop assistant audio immediately
 - shut down the OpenAI session
 - release the media bridge quickly
 - emit `bridge-ended` with reason `star_exit`
 
-### 11.4 Silence behavior
-If the caller remains silent for 8 seconds after assistant audio fully stops:
+### 12.4 Silence behavior
+
+If caller is silent for 8 seconds after assistant audio fully stops:
+
 - allow one short gentle re-engagement prompt
-- do not create an endless loop of “are you there”
+- do not loop endlessly
 - if silence continues, just wait
 
 ---
 
-## 12. Timer and cutoff behavior
+## 13. Timer and cutoff behavior
 
-This service does not decide whether a call is allowed. It only enforces the timing values it receives.
+This service does not decide whether a call is allowed. It only enforces timing values it receives.
 
-### 12.1 Inputs
+### 13.1 Inputs
+
 At session start, the service receives:
+
 - `absolute_cutoff_epoch_ms`
 - `warning_at_seconds`
 
-### 12.2 Required timer loop
+### 13.2 Required timer loop
+
 Run a lightweight loop every 500 ms or better.
 
 Compute:
+
 `remaining_seconds = floor((absolute_cutoff_epoch_ms - now_ms) / 1000)`
 
-### 12.3 Warning logic
+### 13.3 Warning logic
+
 If:
+
 - `warningSent == false`
 - `remaining_seconds <= warning_at_seconds`
 - `remaining_seconds > 0`
 
 Then:
-1. emit `bridge-warning-due` to Core API exactly once
+
+1. emit `bridge-warning-due` exactly once
 2. set `warningSent = true`
 
-### 12.4 Cutoff logic
+### 13.4 Cutoff logic
+
 If:
+
 - `remaining_seconds <= 0`
 
 Then:
-1. emit `bridge-cutoff-due`
-2. end the bridge
-3. emit final `bridge-ended` with reason `time_expired` if telephony has not already ended it
 
-### 12.5 Race rule
-If telephony has already ended the session, the cutoff handler must notice that the session is already ending and avoid duplicate cleanup.
+1. emit `bridge-cutoff-due`
+2. end the bridge locally with reason `time_expired`
+3. emit final `bridge-ended` with reason `time_expired` if Telephony has not already ended it
+
+### 13.5 Race rule
+
+If Telephony already ended the session, the cutoff handler must avoid duplicate cleanup.
 
 ---
 
-## 13. Failure handling
+## 14. Failure handling
 
-### 13.1 OpenAI session creation failure
-If OpenAI session creation fails:
+### 14.1 OpenAI session creation failure
+
 - return `ok=false` from `/internal/bridge/start`
 - do not emit `bridge-connected`
 
-### 13.2 OpenAI disconnect during live session
-If the OpenAI connection drops unexpectedly:
-- attempt one quick recovery if practical and if no more than about 3 seconds of disruption would occur
-- if recovery fails, end the bridge with reason `openai_error`
+### 14.2 OpenAI disconnect during live session
+
+- attempt one quick recovery if practical and under about 3 seconds
+- if recovery fails, end bridge with reason `openai_error`
 - emit `bridge-ended`
 
-### 13.3 Media socket failure
-If the Asterisk media socket becomes invalid:
+### 14.3 Media socket failure
+
 - end bridge with reason `telephony_disconnect`
 
-### 13.4 Core API event callback failure
-Retry as specified above, but do not leak media resources forever.
+### 14.4 Core callback failure
 
-### 13.5 Process shutdown
+Retry as specified above, but do not leak resources forever.
+
+### 14.5 Process shutdown
+
 On SIGTERM / SIGINT:
+
 - stop accepting new starts
 - end all live sessions cleanly
 - emit `bridge-ended` for each if possible
@@ -495,28 +524,28 @@ On SIGTERM / SIGINT:
 
 ---
 
-## 14. Security and privacy rules
+## 15. Security and privacy rules
 
 This service must never store or log:
+
 - payment data
 - raw Authorization tokens
-- full phone numbers in verbose logs unless masked
+- full phone numbers in ordinary logs unless masked
 - raw audio payload dumps in normal operation
 - full transcripts by default
 
 Allowed logging fields:
+
 - `call_session_id`
 - masked `phone_e164`
 - bridge state
 - timing metrics
-- error code / exception type
+- error code
 - OpenAI session reference if non-sensitive
-
-If transcript storage or debugging is added later, it must be behind an explicit feature flag and off by default.
 
 ---
 
-## 15. Configuration and environment variables
+## 16. Configuration and environment variables
 
 Provide `.env.example` with at least:
 
@@ -536,48 +565,51 @@ WARNING_TIMER_INTERVAL_MS=500
 MASK_PHONE_LOGS=true
 ```
 
-If additional variables are needed for media bridging, include them explicitly in `.env.example` and document them in README.
-
 ---
 
-## 16. Required tests
+## 17. Required tests
 
-### 16.1 Unit tests
-- request validation for `/internal/bridge/start`
-- request validation for `/internal/bridge/end`
+### 17.1 Unit tests
+
+- validation for start
+- validation for end
 - timer warning logic
 - timer cutoff logic
 - duplicate session rejection
-- bridge cleanup idempotency
-- masking of phone numbers in logs
+- cleanup idempotency
+- phone masking in logs
 
-### 16.2 Integration tests
-With mocked Core API and mocked OpenAI:
+### 17.2 Integration tests
+
+With mocked Core and mocked OpenAI:
+
 - successful bridge start
 - failed OpenAI session creation
 - warning event emitted once
 - cutoff event emitted at zero
 - star exit tears session down immediately
-- duplicate `end` call does not crash or leak
-- bridge-ended event always emitted on normal teardown
+- duplicate `end` does not leak
+- bridge-ended always emitted on normal teardown
 
-### 16.3 Load/stability tests
-Provide at least a script or documented test plan for multiple simultaneous sessions to ensure:
+### 17.3 Load/stability tests
+
+Provide a script or documented test plan for multiple simultaneous sessions ensuring:
+
 - no leaked timers
-- no memory growth after repeated create/end cycles
-- acceptable latency under expected concurrency
+- no memory growth after repeated cycles
+- acceptable latency
 
 ---
 
-## 17. Definition of done
+## 18. Definition of done
 
 This repository is complete only when:
 
-1. Telephony can call `/internal/bridge/start` and receive a live connected bridge.
-2. Caller audio reaches OpenAI and assistant audio returns to the caller.
-3. Assistant behavior follows the Hebrew phone-appropriate rules above.
-4. Caller interruption works cleanly.
-5. Telephony can terminate instantly with `/internal/bridge/end`.
-6. Warning and cutoff events are emitted correctly.
-7. No transcripts or payment data are stored by default.
-8. The repo contains all code, tests, containerization, and docs necessary to deploy and run the service end to end.
+1. Telephony can call `/internal/bridge/start` and receive a live connected bridge
+2. Caller audio reaches OpenAI and assistant audio returns
+3. Assistant behavior follows the Hebrew phone-appropriate rules above
+4. Caller interruption works cleanly
+5. Telephony can terminate instantly with `/internal/bridge/end`
+6. Warning and cutoff events are emitted correctly to Core
+7. No transcripts or payment data are stored by default
+8. The repo contains all code, tests, containerization, and docs needed to deploy and run it

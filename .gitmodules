@@ -1,0 +1,15 @@
+[submodule "services/gpt-line-core-api"]
+	path = services/gpt-line-core-api
+	url = https://github.com/yossef6548/gpt-line-core-api
+[submodule "services/gpt-line-admin"]
+	path = services/gpt-line-admin
+	url = https://github.com/yossef6548/gpt-line-admin
+[submodule "services/gpt-line-payments"]
+	path = services/gpt-line-payments
+	url = https://github.com/yossef6548/gpt-line-payments
+[submodule "services/gpt-line-realtime-bridge"]
+	path = services/gpt-line-realtime-bridge
+	url = https://github.com/yossef6548/gpt-line-realtime-bridge
+[submodule "services/gpt-line-telephony"]
+	path = services/gpt-line-telephony
+	url = https://github.com/yossef6548/gpt-line-telephony

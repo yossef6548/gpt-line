@@ -8,7 +8,7 @@ It contains:
 - the authoritative standalone specification files for each service
 - the system dependency graphs
 - the recommended development workflow
-- Git submodules that should later point to the actual implementation repositories of each service
+- Git submodules pointing to the actual implementation repositories of each service under the `services/` folder
 
 The actual code for each service should live in its own dedicated GitHub repository. This master repository is the coordination layer and the canonical architecture reference.
 
@@ -210,19 +210,29 @@ Interpretation:
 
 ---
 
-## Planned submodule structure
+## Submodule structure
 
-Once the service repositories are created, this master repository should include them as Git submodules, for example:
+This master repository includes the following Git submodules inside the `services` folder, each pointing to its own standalone GitHub repository:
 
 ```text
-/services/gpt-line-telephony
-/services/gpt-line-realtime-bridge
-/services/gpt-line-core-api
-/services/gpt-line-payments
-/services/gpt-line-admin
+services/gpt-line-core-api        → https://github.com/yossef6548/gpt-line-core-api
+services/gpt-line-payments        → https://github.com/yossef6548/gpt-line-payments
+services/gpt-line-realtime-bridge → https://github.com/yossef6548/gpt-line-realtime-bridge
+services/gpt-line-telephony       → https://github.com/yossef6548/gpt-line-telephony
+services/gpt-line-admin           → https://github.com/yossef6548/gpt-line-admin
 ```
 
-Each submodule should point to its own standalone GitHub repository.
+To clone this repository with all submodules initialized, use:
+
+```bash
+git clone --recurse-submodules https://github.com/yossef6548/gpt-line
+```
+
+Or, if you have already cloned the repository, initialize and update the submodules with:
+
+```bash
+git submodule update --init --recursive
+```
 
 ---
 
@@ -441,11 +451,13 @@ It is primarily a consumer of stable Core and Payments admin APIs.
 
 ## Current contents
 
-At this stage, this repository contains the specifications and project structure planning.
+At this stage, this repository contains:
+
+- the specifications and project structure planning
+- submodule references to each service repository under `services/`
 
 As development progresses, it should also contain:
 
-- submodule references to each service repo
 - top-level architectural notes
 - deployment coordination notes
 - shared operational documentation where useful
